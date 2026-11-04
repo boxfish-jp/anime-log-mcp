@@ -1,25 +1,46 @@
-import OAuthProvider from "@cloudflare/workers-oauth-provider";
-import type { Env } from "./env.js";
-import { mcpApiHandler } from "./mcp-handler.js";
-import { annictOAuthHandler, GRANT_TTL_DAYS } from "./oauth-handler.js";
+import { createAppServer } from "./http.js";
+import { closeMcpHandler } from "./mcp-handler.js";
 
-export type { Env, Props } from "./env.js";
-export { createAnnictMcpServer } from "./server.js";
+const host = process.env.HOST ?? "127.0.0.1";
+const port = Number(process.env.PORT ?? "8000");
+if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+  console.error(`Invalid PORT: ${process.env.PORT}`);
+  process.exit(1);
+}
 
-/**
- * The provider is the MCP server's own authorization server: it issues and
- * validates the tokens MCP clients present, and hands the Annict token stored
- * on each grant to the MCP handler as `ctx.props`. Requests to /mcp without a
- * valid token never reach it.
- */
-export default new OAuthProvider<Env>({
-  apiRoute: "/mcp",
-  apiHandler: mcpApiHandler,
-  defaultHandler: annictOAuthHandler,
-  authorizeEndpoint: "/authorize",
-  tokenEndpoint: "/token",
-  clientRegistrationEndpoint: "/register",
-  // The library's default, set explicitly because the consent screen promises
-  // this retention bound. The grant expires this long after authorization.
-  refreshTokenTTL: GRANT_TTL_DAYS * 24 * 60 * 60,
+const localOnly = host === "127.0.0.1" || host === "::1" || host === "localhost";
+const server = createAppServer({ localOnly });
+
+server.once("error", (error) => {
+  console.error(`Failed to listen on ${host}:${port}: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
 });
+
+server.listen(port, host, () => {
+  const shownHost = host.includes(":") ? `[${host}]` : host;
+  console.log(`anime-log-mcp listening on ${shownHost}:${port} (MCP endpoint: /mcp)`);
+});
+
+let shuttingDown = false;
+let closing: Promise<void> | undefined;
+const closeHandler = () => (closing ??= closeMcpHandler());
+
+const shutdown = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  server.close(() => {
+    void closeHandler().finally(() => process.exit(0));
+  });
+  server.closeIdleConnections();
+
+  const force = setTimeout(() => {
+    server.closeAllConnections();
+    void closeHandler().finally(() => process.exit(0));
+  }, 5000);
+  force.unref();
+};
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, shutdown);
+}

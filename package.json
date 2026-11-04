@@ -9,6 +9,6 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "dev": "npm run dev --workspace=@anime-log-mcp/mcp-server",
-    "deploy": "npm run deploy --workspace=@anime-log-mcp/mcp-server"
+    "start": "npm run start --workspace=@anime-log-mcp/mcp-server"
   }
 }

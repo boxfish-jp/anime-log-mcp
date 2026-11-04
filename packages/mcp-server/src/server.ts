@@ -59,64 +59,28 @@ const annictIdParam = z
  */
 const TOOL_LIST_CACHE_HINT = { ttlMs: 3_600_000, cacheScope: "private" } as const;
 
-export interface AnnictMcpServerOptions {
-  /**
-   * Called when Annict rejects the token with 401, which is what happens once
-   * the user unlinks this application on Annict. Expected to delete whatever
-   * this deployment stores for the user.
-   */
-  onUnauthorized?: () => Promise<void>;
-  /** Appended to every tool result and sent as the server instructions (see migration.ts). */
-  notice?: string;
-  /** When set, every tool fails with this message instead of calling Annict (see migration.ts). */
-  retiredMessage?: string;
-}
-
 /**
- * Builds a fully configured server instance. Under the 2026-07-28 revision
- * there is no session to attach state to, so one of these is built per request
- * from the Annict token that request authenticated with; nothing survives the
- * response.
+ * Builds one server instance per request from the Annict token that request
+ * authenticated with; nothing survives the response.
  */
-export function createAnnictMcpServer(annictAccessToken: string, options: AnnictMcpServerOptions = {}): McpServer {
-  const { retiredMessage } = options;
-  const client = new AnnictClient({
-    accessToken: annictAccessToken,
-    fetch: retiredMessage ? () => Promise.reject(new Error(retiredMessage)) : undefined,
-  });
+export function createAnnictMcpServer(annictAccessToken: string): McpServer {
+  const client = new AnnictClient({ accessToken: annictAccessToken });
 
-  const withNotice = (result: ToolResult): ToolResult =>
-    options.notice ? { ...result, content: [...result.content, { type: "text", text: options.notice }] } : result;
-
-  const ok = (data: unknown): ToolResult => withNotice(okResult(data));
-
-  async function fail(error: unknown): Promise<ToolResult> {
-    return withNotice(await describeFailure(error));
-  }
-
-  async function describeFailure(error: unknown): Promise<ToolResult> {
-    if (!(error instanceof AnnictApiError) || error.status !== 401 || !options.onUnauthorized) {
-      return errorResult(error);
+  const failureResult = (error: unknown): ToolResult => {
+    if (error instanceof AnnictApiError && error.status === 401) {
+      return errorResult(
+        new Error(
+          "Annict rejected the access token (HTTP 401). Check the Authorization header in your MCP client configuration; the token may have been deleted or revoked.",
+        ),
+      );
     }
-    try {
-      await options.onUnauthorized();
-    } catch (cleanupError) {
-      console.error("Failed to delete the grant after Annict returned 401", cleanupError);
-      return errorResult(error);
-    }
-    return errorResult(
-      new Error(
-        "Annict rejected the access token (HTTP 401), most likely because the user unlinked this application on Annict. " +
-          "The authorization this client used has been deleted from this server; reconnect to authorize again.",
-      ),
-    );
-  }
+    return errorResult(error);
+  };
 
   const server = new McpServer(
     { name: "anime-log-mcp", version: "0.1.0" },
     {
       capabilities: { tools: {} },
-      instructions: options.notice ?? retiredMessage,
       cacheHints: {
         "tools/list": TOOL_LIST_CACHE_HINT,
         "server/discover": TOOL_LIST_CACHE_HINT,
@@ -129,9 +93,9 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     { description: "Get the authenticated Annict user's profile and watch-status counts." },
     async () => {
       try {
-        return ok(await client.getViewer());
+        return okResult(await client.getViewer());
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -147,9 +111,9 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     async ({ username }) => {
       try {
         const user = await client.getUser(username);
-        return ok(user ?? { found: false });
+        return okResult(user ?? { found: false });
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -167,7 +131,7 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     },
     async ({ status, first, after }) => {
       try {
-        return ok(
+        return okResult(
           await client.getLibraryEntries({
             states: status ? [status] : undefined,
             first: first ?? DEFAULT_PAGE_SIZE,
@@ -175,7 +139,7 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
           }),
         );
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -194,10 +158,10 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     async ({ title, season, first, after }) => {
       // Without a filter this would ask Annict for its entire catalogue.
       if (!title && !season) {
-        return fail(new Error("Provide at least one of 'title' or 'season'."));
+        return failureResult(new Error("Provide at least one of 'title' or 'season'."));
       }
       try {
-        return ok(
+        return okResult(
           await client.searchWorks({
             titles: title ? [title] : undefined,
             seasons: season ? [season] : undefined,
@@ -206,7 +170,7 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
           }),
         );
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -227,10 +191,10 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     async ({ name, annictId, first, after }) => {
       // Without a filter this would ask Annict for every character it knows.
       if (!name && annictId === undefined) {
-        return fail(new Error("Provide at least one of 'name' or 'annictId'."));
+        return failureResult(new Error("Provide at least one of 'name' or 'annictId'."));
       }
       try {
-        return ok(
+        return okResult(
           await client.searchCharacters({
             names: name ? [name] : undefined,
             annictIds: annictId === undefined ? undefined : [annictId],
@@ -239,7 +203,7 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
           }),
         );
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -260,10 +224,10 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     async ({ name, annictId, first, after }) => {
       // Without a filter this would ask Annict for every person it knows.
       if (!name && annictId === undefined) {
-        return fail(new Error("Provide at least one of 'name' or 'annictId'."));
+        return failureResult(new Error("Provide at least one of 'name' or 'annictId'."));
       }
       try {
-        return ok(
+        return okResult(
           await client.searchPeople({
             names: name ? [name] : undefined,
             annictIds: annictId === undefined ? undefined : [annictId],
@@ -272,7 +236,7 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
           }),
         );
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -293,10 +257,10 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     async ({ name, annictId, first, after }) => {
       // Without a filter this would ask Annict for every organization it knows.
       if (!name && annictId === undefined) {
-        return fail(new Error("Provide at least one of 'name' or 'annictId'."));
+        return failureResult(new Error("Provide at least one of 'name' or 'annictId'."));
       }
       try {
-        return ok(
+        return okResult(
           await client.searchOrganizations({
             names: name ? [name] : undefined,
             annictIds: annictId === undefined ? undefined : [annictId],
@@ -305,7 +269,7 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
           }),
         );
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -321,9 +285,9 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     async ({ annictId }) => {
       try {
         const work = await client.getWork(annictId);
-        return ok(work ?? { found: false });
+        return okResult(work ?? { found: false });
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -340,9 +304,9 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     },
     async ({ workAnnictId, first, after }) => {
       try {
-        return ok(await client.getEpisodes({ workAnnictId, first: first ?? DEFAULT_PAGE_SIZE, after }));
+        return okResult(await client.getEpisodes({ workAnnictId, first: first ?? DEFAULT_PAGE_SIZE, after }));
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -358,9 +322,9 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     },
     async ({ episodeId, comment }) => {
       try {
-        return ok(await client.createRecord({ episodeId, comment }));
+        return okResult(await client.createRecord({ episodeId, comment }));
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );
@@ -376,9 +340,9 @@ export function createAnnictMcpServer(annictAccessToken: string, options: Annict
     },
     async ({ workId, state }) => {
       try {
-        return ok(await client.updateStatus({ workId, state }));
+        return okResult(await client.updateStatus({ workId, state }));
       } catch (error) {
-        return fail(error);
+        return failureResult(error);
       }
     },
   );

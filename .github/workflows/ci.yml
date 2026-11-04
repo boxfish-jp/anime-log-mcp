@@ -1,7 +1,6 @@
 name: CI
 
-# main への push では Cloudflare Workers Builds が同じ typecheck / test を
-# 実行してからデプロイするため、ここではマージ前のPRだけを検査する。
+# デプロイはこのワークフローでは行わない。マージ前に typecheck / test を実行する。
 on:
   pull_request:
 

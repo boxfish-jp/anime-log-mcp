@@ -1,68 +1,17 @@
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mcpApiHandler } from "../src/mcp-handler.js";
-import type { Env, Props } from "../src/env.js";
+import { bearerToken, handleMcpRequest } from "../src/mcp-handler.js";
 
 const SERVER_URL = new URL("https://anime-log-mcp.test/mcp");
+const MCP_TOKEN = "annict-token";
 
-const PROPS: Props = {
-  annictAccessToken: "annict-token",
-  annictUsername: "mokuichi",
-  clientId: "mcp-client-1",
-  scope: "read write",
-};
+const serve = (request: Request): Promise<Response> => handleMcpRequest(request);
 
-/** Only `props` is read by the handler; the rest of ExecutionContext is unused. */
-function executionContext(props: Props = PROPS): ExecutionContext {
-  return { props, waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext;
-}
-
-const MCP_TOKEN = "1:grant-1:secret";
-
-/**
- * The helpers the MCP handler could use to delete grants. unwrapToken and
- * listUserGrants are kept only to prove the cleanup does not use them.
- */
-const oauthProvider = {
-  unwrapToken: vi.fn(),
-  listUserGrants: vi.fn(),
-  revokeGrant: vi.fn(),
-};
-
-const env = { OAUTH_PROVIDER: oauthProvider } as unknown as Env;
-
-/**
- * Every request is served in isolation, exactly as a Worker isolate would:
- * a fresh ExecutionContext carrying the grant's props and nothing else.
- */
-function serve(request: Request): Promise<Response> {
-  return mcpApiHandler.fetch(request, env, executionContext());
-}
-
-async function connectClient(): Promise<Client> {
-  const client = new Client(
-    { name: "test-client", version: "0.0.0" },
-    // Modern-only: the connection fails outright if the server cannot speak
-    // 2026-07-28, so nothing here can silently fall back to a 2025 session.
-    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
-  );
-  const transport = new StreamableHTTPClientTransport(SERVER_URL, {
-    fetch: (url, init) => {
-      const request = new Request(url, init);
-      request.headers.set("Authorization", `Bearer ${MCP_TOKEN}`);
-      return serve(request);
-    },
-  });
-  await client.connect(transport);
-  return client;
-}
-
-function graphqlResponse(data: unknown): Response {
-  return new Response(JSON.stringify({ data }), {
+const graphqlResponse = (data: unknown): Response =>
+  new Response(JSON.stringify({ data }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-}
 
 const VIEWER = {
   id: "VXNlci0x",
@@ -78,22 +27,38 @@ const VIEWER = {
   recordsCount: 400,
 };
 
-describe("stateless MCP handler", () => {
+describe("handleMcpRequest", () => {
   let annictFetch: ReturnType<typeof vi.fn>;
+  const clients: Client[] = [];
+
+  const connectClient = async (token = MCP_TOKEN): Promise<Client> => {
+    const client = new Client(
+      { name: "test-client", version: "0.0.0" },
+      { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+    );
+    const transport = new StreamableHTTPClientTransport(SERVER_URL, {
+      fetch: (url, init) => {
+        const request = new Request(url, init);
+        request.headers.set("Authorization", `Bearer ${token}`);
+        return serve(request);
+      },
+    });
+    await client.connect(transport);
+    clients.push(client);
+    return client;
+  };
 
   beforeEach(() => {
     annictFetch = vi.fn(async () => graphqlResponse({ viewer: VIEWER }));
     vi.stubGlobal("fetch", annictFetch);
-    oauthProvider.unwrapToken.mockReset().mockResolvedValue({ grantId: "grant-1", userId: "1" });
-    oauthProvider.listUserGrants.mockReset().mockResolvedValue({ items: [] });
-    oauthProvider.revokeGrant.mockReset().mockResolvedValue(undefined);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await Promise.all(clients.splice(0).map((client) => client.close().catch(() => {})));
     vi.unstubAllGlobals();
   });
 
-  it("serves tools/list on a 2026-07-28 connection", async () => {
+  it("2026-07-28の接続でtools/listを返す", async () => {
     const client = await connectClient();
     expect(client.getProtocolEra()).toBe("modern");
 
@@ -115,17 +80,15 @@ describe("stateless MCP handler", () => {
     await client.close();
   });
 
-  it("answers a bare tools/list with no handshake and no session header", async () => {
+  it("ハンドシェイクなしのtools/listにセッションヘッダーなしで応答する", async () => {
     const response = await serve(
       new Request(SERVER_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
+          Authorization: `Bearer ${MCP_TOKEN}`,
           "Mcp-Method": "tools/list",
-          // Required since SDK 2.3.0: the transport rejects a request whose
-          // header and body envelope disagree on the protocol version, so a
-          // body naming 2026-07-28 must carry the matching header.
           "MCP-Protocol-Version": "2026-07-28",
         },
         body: JSON.stringify({
@@ -143,14 +106,11 @@ describe("stateless MCP handler", () => {
     );
 
     expect(response.status).toBe(200);
-    // The header is gone from the transport as of 2026-07-28; nothing here
-    // asked to be remembered, and nothing was.
     expect(response.headers.get("mcp-session-id")).toBeNull();
 
     const body = (await response.json()) as { result: Record<string, unknown> };
     expect(body.result).toMatchObject({
       resultType: "complete",
-      // Required on list results by the CacheableResult interface.
       ttlMs: expect.any(Number),
       cacheScope: "private",
       _meta: {
@@ -160,7 +120,34 @@ describe("stateless MCP handler", () => {
     expect(body.result.tools).toHaveLength(11);
   });
 
-  it("calls a tool with the Annict token taken from the request's grant", async () => {
+  it("2025-06-18のinitializeに応答する", async () => {
+    const response = await serve(
+      new Request(SERVER_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          Authorization: `Bearer ${MCP_TOKEN}`,
+          "MCP-Protocol-Version": "2025-06-18",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "legacy-client", version: "0.0.0" },
+          },
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await response.body?.cancel();
+  });
+
+  it("AuthorizationヘッダーのAnnictトークンでツールを呼び出す", async () => {
     const client = await connectClient();
 
     const result = await client.callTool({ name: "annict_get_viewer", arguments: {} });
@@ -173,33 +160,33 @@ describe("stateless MCP handler", () => {
     await client.close();
   });
 
-  it("serves two tool calls independently, each on its own connection", async () => {
-    const first = await connectClient();
+  it("2つの異なるトークンで独立して処理する", async () => {
+    const first = await connectClient("annict-token-1");
     await first.callTool({ name: "annict_get_viewer", arguments: {} });
     await first.close();
 
-    // A second, entirely separate client gets the same answer with no shared
-    // state — there is nothing an earlier request could have left behind.
-    const second = await connectClient();
+    const second = await connectClient("annict-token-2");
     const result = await second.callTool({ name: "annict_get_viewer", arguments: {} });
     await second.close();
 
     expect(result.isError).toBeFalsy();
     expect(annictFetch).toHaveBeenCalledTimes(2);
+    const auths = annictFetch.mock.calls.map(([, init]) => (init as RequestInit).headers);
+    expect(auths[0]).toMatchObject({ Authorization: "bearer annict-token-1" });
+    expect(auths[1]).toMatchObject({ Authorization: "bearer annict-token-2" });
   });
 
-  it("rejects a search that would have no filter at all", async () => {
+  it("フィルタのない検索を拒否する", async () => {
     const client = await connectClient();
     const result = await client.callTool({ name: "annict_search_characters", arguments: {} });
     await client.close();
 
     expect(result.isError).toBe(true);
     expect((result.content as Array<{ text: string }>)[0]!.text).toContain("'name' or 'annictId'");
-    // Nothing should have reached Annict.
     expect(annictFetch).not.toHaveBeenCalled();
   });
 
-  it("passes the singular search arguments through as Annict's list variables", async () => {
+  it("単数の検索引数をAnnictのリスト変数として渡す", async () => {
     annictFetch.mockResolvedValueOnce(
       graphqlResponse({
         searchCharacters: {
@@ -222,7 +209,7 @@ describe("stateless MCP handler", () => {
     expect(body.variables).toMatchObject({ names: ["レム"], annictIds: [42], first: 25 });
   });
 
-  it("deletes the grant when Annict rejects the token", async () => {
+  it("Annictが401を返すとAuthorizationヘッダーの確認を促す", async () => {
     annictFetch.mockResolvedValueOnce(new Response("unauthorized", { status: 401 }));
 
     const client = await connectClient();
@@ -232,56 +219,10 @@ describe("stateless MCP handler", () => {
     expect(result.isError).toBe(true);
     const text = (result.content as Array<{ text: string }>)[0]!.text;
     expect(text).toContain("401");
-    expect(text).toContain("has been deleted");
-    // The user unlinked the app on Annict, so their stored token goes too.
-    expect(oauthProvider.revokeGrant).toHaveBeenCalledWith("grant-1", "1");
+    expect(text).toContain("Check the Authorization header");
   });
 
-  it("leaves the user's other grants alone", async () => {
-    annictFetch.mockResolvedValueOnce(new Response("unauthorized", { status: 401 }));
-
-    const client = await connectClient();
-    await client.callTool({ name: "annict_get_viewer", arguments: {} });
-    await client.close();
-
-    // Another MCP client's grant may come from re-authorizing after the
-    // unlink, and nothing visible here tells it apart from a dead one — not
-    // even creation order — so only the rejected grant goes.
-    expect(oauthProvider.revokeGrant.mock.calls).toEqual([["grant-1", "1"]]);
-    expect(oauthProvider.listUserGrants).not.toHaveBeenCalled();
-  });
-
-  it("deletes the grant even if the MCP token expires while Annict is answering", async () => {
-    annictFetch.mockResolvedValueOnce(new Response("unauthorized", { status: 401 }));
-    // What unwrapToken() returns once the token has expired.
-    oauthProvider.unwrapToken.mockResolvedValue(null);
-
-    const client = await connectClient();
-    const result = await client.callTool({ name: "annict_get_viewer", arguments: {} });
-    await client.close();
-
-    expect(oauthProvider.revokeGrant).toHaveBeenCalledWith("grant-1", "1");
-    expect(oauthProvider.unwrapToken).not.toHaveBeenCalled();
-    expect((result.content as Array<{ text: string }>)[0]!.text).toContain("has been deleted");
-  });
-
-  it("does not claim the data was deleted when revoking fails", async () => {
-    annictFetch.mockResolvedValueOnce(new Response("unauthorized", { status: 401 }));
-    oauthProvider.revokeGrant.mockRejectedValueOnce(new Error("KV unavailable"));
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    const client = await connectClient();
-    const result = await client.callTool({ name: "annict_get_viewer", arguments: {} });
-    await client.close();
-    consoleError.mockRestore();
-
-    expect(result.isError).toBe(true);
-    const text = (result.content as Array<{ text: string }>)[0]!.text;
-    expect(text).toContain("401");
-    expect(text).not.toContain("deleted");
-  });
-
-  it("keeps the grant on errors other than 401", async () => {
+  it("401以外のエラーはそのまま返す", async () => {
     annictFetch.mockResolvedValueOnce(new Response("boom", { status: 500 }));
 
     const client = await connectClient();
@@ -289,10 +230,10 @@ describe("stateless MCP handler", () => {
     await client.close();
 
     expect(result.isError).toBe(true);
-    expect(oauthProvider.revokeGrant).not.toHaveBeenCalled();
+    expect((result.content as Array<{ text: string }>)[0]!.text).toContain("500");
   });
 
-  it("tells the caller how long to wait when Annict is rate limiting", async () => {
+  it("Annictのレート制限時に待つ秒数を返す", async () => {
     annictFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ errors: [{ type: "too_many_requests" }] }), {
         status: 429,
@@ -306,8 +247,41 @@ describe("stateless MCP handler", () => {
 
     expect(result.isError).toBe(true);
     expect((result.content as Array<{ text: string }>)[0]!.text).toContain("retry after 42 seconds");
-    // 42s is beyond what is waited out in place, so no second request is sent.
     expect(annictFetch).toHaveBeenCalledTimes(1);
-    expect(oauthProvider.revokeGrant).not.toHaveBeenCalled();
+  });
+
+  it("Authorizationヘッダーがない場合は401を返し、OAuthのチャレンジを付けない", async () => {
+    const response = await handleMcpRequest(new Request(SERVER_URL));
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await response.text()).toContain("Missing Authorization");
+  });
+
+  it("Bearer以外のAuthorizationでもトークンを本文に出さない", async () => {
+    const response = await handleMcpRequest(
+      new Request(SERVER_URL, { headers: { Authorization: "Basic secret-token" } }),
+    );
+    const text = await response.text();
+
+    expect(response.status).toBe(401);
+    expect(text).not.toContain("secret-token");
+  });
+});
+
+describe("bearerToken", () => {
+  it.each([
+    ["bearer token", "token"],
+    ["BEARER token", "token"],
+    ["Bearer   token", "token"],
+    ["Basic token", null],
+    ["Bearer", null],
+    ["Bearer   ", null],
+    [null, null],
+    [undefined, null],
+  ])("%sを受け取ると%sを返す", (header, expected) => {
+    expect(bearerToken(header)).toBe(expected);
   });
 });
