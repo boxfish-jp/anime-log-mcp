@@ -3,12 +3,6 @@ import { createAnnictMcpServer } from "./server.js";
 
 preloadSchemas();
 
-export const bearerToken = (authorization: string | null | undefined): string | null => {
-  const match = /^Bearer\s+(.+)$/i.exec(authorization ?? "");
-  const token = match?.[1]?.trim();
-  return token || null;
-};
-
 const mcpHandler = createMcpHandler(
   (ctx) => {
     const token = ctx.authInfo?.token;
@@ -24,10 +18,10 @@ const mcpHandler = createMcpHandler(
 export const closeMcpHandler = () => mcpHandler.close();
 
 export const handleMcpRequest = async (request: Request): Promise<Response> => {
-  const token = bearerToken(request.headers.get("authorization"));
+  const token = process.env.ANNICT_ACCESS_TOKEN;
   if (!token) {
-    return new Response("Missing Authorization: Bearer <Annict personal access token>.", {
-      status: 401,
+    return new Response("ANNICT_ACCESS_TOKEN is not configured on the server.", {
+      status: 503,
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
@@ -35,6 +29,6 @@ export const handleMcpRequest = async (request: Request): Promise<Response> => {
       },
     });
   }
-  const authInfo: AuthInfo = { token, clientId: "", scopes: [] };
+  const authInfo: AuthInfo = { token, clientId: "anime-log-mcp", scopes: [] };
   return mcpHandler.fetch(request, { authInfo });
 };

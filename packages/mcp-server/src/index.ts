@@ -1,5 +1,25 @@
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createAppServer } from "./http.js";
 import { closeMcpHandler } from "./mcp-handler.js";
+
+const configHome = process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
+const envFile = process.env.ANNICT_ENV_FILE ?? join(configHome, "anime-log-mcp", ".env");
+
+if (!process.env.ANNICT_ACCESS_TOKEN && existsSync(envFile)) {
+  try {
+    process.loadEnvFile(envFile);
+  } catch (error) {
+    console.error(`Failed to load ${envFile}`, error);
+    process.exit(1);
+  }
+}
+
+if (!process.env.ANNICT_ACCESS_TOKEN) {
+  console.error(`ANNICT_ACCESS_TOKEN is not set. Write it to ${envFile} or set it in the environment.`);
+  process.exit(1);
+}
 
 const host = process.env.HOST ?? "127.0.0.1";
 const port = Number(process.env.PORT ?? "8000");

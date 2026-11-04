@@ -14,16 +14,20 @@ npmで公開されている `annict` パッケージはREST API v1をラップ�
 - Node.js 22系とnpm。動作確認済みのNode.jsは22.23.4。
 - Nixを使う場合はflakesを有効にしたNix。対応システムは `x86_64-linux` / `aarch64-linux` のみ（macOSは対象外）。
 - 動作確認済みは `x86_64-linux`。`aarch64-linux` は未検証。
-- Annictの個人用アクセストークン（スコープ: 読み込み + 書き込み）は利用者が用意する。
+- Annictの個人用アクセストークン（スコープ: 読み込み + 書き込み）を `.env` に設定する。
 
 ## 使い方
 
 ```sh
+mkdir -p ~/.config/anime-log-mcp
+cp .env.example ~/.config/anime-log-mcp/.env
+chmod 600 ~/.config/anime-log-mcp/.env
+# .env の ANNICT_ACCESS_TOKEN を設定する
 npm ci
 npm run dev
 ```
 
-`npm run dev` はファイル変更を監視して起動し、`npm start` は監視なしで起動します。MCPのエンドポイントは `http://127.0.0.1:8000/mcp` です。`GET /healthz` は `{"status":"ok"}` を返します。
+`npm run dev` はファイル変更を監視して起動し、`npm start` は監視なしで起動します。サーバーは起動時に `.env` を読み、`ANNICT_ACCESS_TOKEN` が無ければエラーで終了します。MCPのエンドポイントは `http://127.0.0.1:8000/mcp` です。`GET /healthz` は `{"status":"ok"}` を返します。
 
 `SIGINT` / `SIGTERM` を受けると、新規接続を止め、進行中のリクエストを最大5秒待ってから打ち切ります。
 
@@ -33,6 +37,8 @@ npm run dev
 |---|---|---|
 | `HOST` | `127.0.0.1` | 待ち受けアドレス |
 | `PORT` | `8000` | 待ち受けポート |
+
+`HOST` と `PORT` は `.env` にも書けます。既に環境変数が設定されている場合は、そちらが優先されます。
 
 - 既定の `127.0.0.1` では、Host と Origin を localhost に限定します。
 - `HOST=0.0.0.0` は LAN/外部から到達でき、TLS なしではトークンが平文で流れます。
@@ -57,40 +63,80 @@ npm run typecheck
 npm test
 ```
 
+### Home Manager
+
+flake の input に追加します。
+
+```nix
+inputs.anime-log-mcp.url = "github:boxfish-jp/anime-log-mcp";
+```
+
+`home.nix` で module を import し、サービスを有効にします。
+
+```nix
+imports = [ inputs.anime-log-mcp.homeManagerModules.default ];
+
+services.anime-log-mcp = {
+  enable = true;
+  host = "127.0.0.1";
+  port = 8000;
+  envFile = "${config.home.homeDirectory}/.config/anime-log-mcp/.env";
+};
+```
+
+`envFile` の既定値は `${config.home.homeDirectory}/.config/anime-log-mcp/.env` です。上の例は既定値を明示したものです。`.env` の作り方は「使い方」を参照してください。
+
+サービスは systemd user service として動きます。
+
+```sh
+systemctl --user start anime-log-mcp
+systemctl --user status anime-log-mcp
+```
+
+ログインしていない間も動かす場合は linger を有効にします。NixOS では `users.users.<ユーザー名>.linger = true`、それ以外では `loginctl enable-linger "$USER"` を設定します。
+
+トークンは `.env` にだけ書き、Nixの設定には書きません。`envFile` は `EnvironmentFile` として読まれます。`.env` を変更したら `systemctl --user restart anime-log-mcp` で再起動してください。`host = "0.0.0.0"` にする場合の注意は前述の TLS / リバースプロキシの記述を参照してください。
+
 ## MCPクライアントの設定
 
-MCPクライアントがカスタムヘッダーに対応している必要があります。URLを登録するだけのOAuth専用クライアントでは使えません。
+MCPクライアントには URL だけを登録します。認証ヘッダーは不要です。
 
 ```json
 {
   "mcpServers": {
     "anime-log": {
-      "url": "http://127.0.0.1:8000/mcp",
-      "headers": {
-        "Authorization": "Bearer <Annictの個人用アクセストークン>"
-      }
+      "url": "http://127.0.0.1:8000/mcp"
     }
   }
 }
 ```
 
-トークンは https://annict.com/settings/apps で「個人用アクセストークン」を新規作成し、スコープを「読み込み + 書き込み」にして取得してください。読み込み専用のトークンでは、視聴記録の作成やステータス更新のツールは使えません。
-
-個人用アクセストークンは、他の人に教えたり公開したりしないでください。MCPクライアントの設定ファイルに保存されるため、そのファイルの権限と取り扱いにも注意してください。
+`http://127.0.0.1:8000/mcp` は既定の待ち受けアドレスです。`HOST` / `PORT` を変えた場合は合わせてください。
 
 ## 認証
 
-認証には `Authorization: Bearer <Annictの個人用アクセストークン>` ヘッダーだけを使います。クエリパラメータやCookieは使いません。
+サーバーは単一の `ANNICT_ACCESS_TOKEN` を使います。MCPクライアントごとの認証はしません。
 
-このサーバーは、自分が管理する環境で動かしてください。他人が運用するサーバーに個人用アクセストークンを設定すると、その運用者はあなたのAnnictアカウントとして読み書きできます。
+- 既定の `.env` は `$XDG_CONFIG_HOME/anime-log-mcp/.env`。`XDG_CONFIG_HOME` が未設定なら `~/.config/anime-log-mcp/.env`。
+- `ANNICT_ENV_FILE` で `.env` のパスを上書きできます。
+- `ANNICT_ACCESS_TOKEN` を環境変数で設定した場合は `.env` を読みません。`HOST` / `PORT` も `.env` から読みたい場合は、トークンも `.env` に書いてください。
+- `.env` の形式は次のとおりです。
 
-API利用規約第4条は、自分のアクセストークンを第三者に渡さないことを求めています。自分以外に提供する場合は、この点を利用者に明示してください。ローカルで自分だけが使う場合も、自分専用の環境として扱ってください。
+  ```sh
+  ANNICT_ACCESS_TOKEN=...
+  # HOST=127.0.0.1
+  # PORT=8000
+  ```
 
-サーバーはトークンを保存しません。リクエストごとに、そのリクエストの `Authorization` ヘッダーのトークンでAnnict GraphQL APIを呼び出すだけです。データベースや取得データのキャッシュもありません。
+- トークンは https://annict.com/settings/apps で「個人用アクセストークン」を新規作成し、スコープを「読み込み + 書き込み」にして取得します。読み込み専用のトークンでは、視聴記録の作成やステータス更新のツールは使えません。
+- `.env` は `chmod 600` にし、コミットしないでください。リポジトリの `.env.example` をコピーして使います。
+- `nix run` / `npm start` / systemd のどれでも、起動時に同じ `.env` を読みます。`ANNICT_ACCESS_TOKEN` が無ければサーバーは起動しません。
+- トークンはサーバーの `.env` に保存されます。不要になったら `.env` から削除し、Annict側でもトークンを削除してください。
+- Annictが401を返したときは、`.env` の `ANNICT_ACCESS_TOKEN` を確認し、サービスを再起動してください。トークンが削除・失効している可能性があります。
 
-Annictが401を返したときは、ツールの結果をエラーにし、MCPクライアントの `Authorization` ヘッダーを確認するよう案内します。トークンが削除・失効している可能性があります。
+**このサーバーはMCPクライアントの認証をしません。`/mcp` に到達できる相手は、そのAnnictアカウントとしてツールを呼び出せます。** 既定の `127.0.0.1` のまま、自分専用の環境で使ってください。外部に公開する場合は、認証付きのリバースプロキシを必ず前段に置いてください。TLSだけでは不十分です。
 
-サーバーのプロセスはリクエスト処理中にトークンを扱えます。`Authorization` ヘッダーをログに残さないでください。
+他人が運用するサーバーに自分のトークンを置くと、その運用者はあなたのAnnictアカウントとして読み書きできます。API利用規約第4条は、自分のアクセストークンを第三者に渡さないことを求めています。自分以外に提供する場合は、この点を利用者に明示してください。
 
 ## Annict API利用規約への対応
 
@@ -98,11 +144,11 @@ Annictが401を返したときは、ツールの結果をエラーにし、MCP�
 
 ### 個人用アクセストークンの説明 (第4条)
 
-このサーバーで使う個人用アクセストークンでは、Annictのデータの読み取りと、視聴記録の作成・視聴ステータスの更新ができます。トークンを他の人に教えたり公開したりしないでください。
+このサーバーで使う個人用アクセストークンでは、Annictのデータの読み取りと、視聴記録の作成・視聴ステータスの更新ができます。トークンを他の人に教えたり公開したりしないでください。サーバーの `.env` に保存するトークンは、サーバーを運用する人が読める状態になります。自分が管理する環境でのみ使ってください。
 
 ### 保存する利用者情報と削除 (第6条・第7条)
 
-サーバーは利用者情報を保存しません。APIから取得した作品情報や記録はリクエストのたびに取得して返すだけで、保存もキャッシュもしません。運用をやめるときに、サーバー側で削除する利用者情報はありません。
+サーバーは `.env` に `ANNICT_ACCESS_TOKEN` を保存します。これはAPIの資格情報であり、Annictの利用者情報ではありません。APIから取得した作品情報や記録はリクエストのたびに取得して返すだけで、保存もキャッシュもしません。運用をやめるときは `.env` を削除してください。
 
 ### レート制限 (第11条)
 
@@ -144,7 +190,7 @@ npm test
 ```
 
 - `annict-client` — `fetch` をモックしたユニットテスト
-- `mcp-server` — MCPハンドラーとNode.js HTTPサーバーの結合テスト。`Authorization` ヘッダーの検証、ツール一覧、ツール呼び出し、レート制限、401時の案内を確認します
+- `mcp-server` — MCPハンドラーとNode.js HTTPサーバーの結合テスト。`.env` のトークン、ツール一覧、ツール呼び出し、レート制限、401時の案内を確認します
 
 ## 型チェック
 

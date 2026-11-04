@@ -60,8 +60,8 @@ const annictIdParam = z
 const TOOL_LIST_CACHE_HINT = { ttlMs: 3_600_000, cacheScope: "private" } as const;
 
 /**
- * Builds one server instance per request from the Annict token that request
- * authenticated with; nothing survives the response.
+ * Builds one server instance per request from the server's Annict token;
+ * nothing survives the response.
  */
 export function createAnnictMcpServer(annictAccessToken: string): McpServer {
   const client = new AnnictClient({ accessToken: annictAccessToken });
@@ -70,7 +70,7 @@ export function createAnnictMcpServer(annictAccessToken: string): McpServer {
     if (error instanceof AnnictApiError && error.status === 401) {
       return errorResult(
         new Error(
-          "Annict rejected the access token (HTTP 401). Check the Authorization header in your MCP client configuration; the token may have been deleted or revoked.",
+          "Annict rejected the access token (HTTP 401). Check ANNICT_ACCESS_TOKEN in the server's environment or .env file; the token may have been deleted or revoked.",
         ),
       );
     }

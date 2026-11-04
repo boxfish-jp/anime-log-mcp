@@ -1,9 +1,10 @@
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { bearerToken, handleMcpRequest } from "../src/mcp-handler.js";
+import { handleMcpRequest } from "../src/mcp-handler.js";
 
 const SERVER_URL = new URL("https://anime-log-mcp.test/mcp");
-const MCP_TOKEN = "annict-token";
+const ANNICT_TOKEN = "annict-token";
+const originalToken = process.env.ANNICT_ACCESS_TOKEN;
 
 const serve = (request: Request): Promise<Response> => handleMcpRequest(request);
 
@@ -31,17 +32,13 @@ describe("handleMcpRequest", () => {
   let annictFetch: ReturnType<typeof vi.fn>;
   const clients: Client[] = [];
 
-  const connectClient = async (token = MCP_TOKEN): Promise<Client> => {
+  const connectClient = async (): Promise<Client> => {
     const client = new Client(
       { name: "test-client", version: "0.0.0" },
       { versionNegotiation: { mode: { pin: "2026-07-28" } } },
     );
     const transport = new StreamableHTTPClientTransport(SERVER_URL, {
-      fetch: (url, init) => {
-        const request = new Request(url, init);
-        request.headers.set("Authorization", `Bearer ${token}`);
-        return serve(request);
-      },
+      fetch: (url, init) => serve(new Request(url, init)),
     });
     await client.connect(transport);
     clients.push(client);
@@ -49,12 +46,15 @@ describe("handleMcpRequest", () => {
   };
 
   beforeEach(() => {
+    process.env.ANNICT_ACCESS_TOKEN = ANNICT_TOKEN;
     annictFetch = vi.fn(async () => graphqlResponse({ viewer: VIEWER }));
     vi.stubGlobal("fetch", annictFetch);
   });
 
   afterEach(async () => {
     await Promise.all(clients.splice(0).map((client) => client.close().catch(() => {})));
+    if (originalToken === undefined) delete process.env.ANNICT_ACCESS_TOKEN;
+    else process.env.ANNICT_ACCESS_TOKEN = originalToken;
     vi.unstubAllGlobals();
   });
 
@@ -87,7 +87,6 @@ describe("handleMcpRequest", () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
-          Authorization: `Bearer ${MCP_TOKEN}`,
           "Mcp-Method": "tools/list",
           "MCP-Protocol-Version": "2026-07-28",
         },
@@ -127,7 +126,6 @@ describe("handleMcpRequest", () => {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
-          Authorization: `Bearer ${MCP_TOKEN}`,
           "MCP-Protocol-Version": "2025-06-18",
         },
         body: JSON.stringify({
@@ -147,7 +145,7 @@ describe("handleMcpRequest", () => {
     await response.body?.cancel();
   });
 
-  it("AuthorizationヘッダーのAnnictトークンでツールを呼び出す", async () => {
+  it("サーバーのANNICT_ACCESS_TOKENでツールを呼び出す", async () => {
     const client = await connectClient();
 
     const result = await client.callTool({ name: "annict_get_viewer", arguments: {} });
@@ -155,25 +153,9 @@ describe("handleMcpRequest", () => {
     expect(JSON.parse((result.content as Array<{ text: string }>)[0]!.text)).toEqual(VIEWER);
 
     const [, init] = annictFetch.mock.calls[0]!;
-    expect((init as RequestInit).headers).toMatchObject({ Authorization: "bearer annict-token" });
+    expect((init as RequestInit).headers).toMatchObject({ Authorization: `bearer ${ANNICT_TOKEN}` });
 
     await client.close();
-  });
-
-  it("2つの異なるトークンで独立して処理する", async () => {
-    const first = await connectClient("annict-token-1");
-    await first.callTool({ name: "annict_get_viewer", arguments: {} });
-    await first.close();
-
-    const second = await connectClient("annict-token-2");
-    const result = await second.callTool({ name: "annict_get_viewer", arguments: {} });
-    await second.close();
-
-    expect(result.isError).toBeFalsy();
-    expect(annictFetch).toHaveBeenCalledTimes(2);
-    const auths = annictFetch.mock.calls.map(([, init]) => (init as RequestInit).headers);
-    expect(auths[0]).toMatchObject({ Authorization: "bearer annict-token-1" });
-    expect(auths[1]).toMatchObject({ Authorization: "bearer annict-token-2" });
   });
 
   it("フィルタのない検索を拒否する", async () => {
@@ -209,7 +191,7 @@ describe("handleMcpRequest", () => {
     expect(body.variables).toMatchObject({ names: ["レム"], annictIds: [42], first: 25 });
   });
 
-  it("Annictが401を返すとAuthorizationヘッダーの確認を促す", async () => {
+  it("Annictが401を返すとANNICT_ACCESS_TOKENの確認を促す", async () => {
     annictFetch.mockResolvedValueOnce(new Response("unauthorized", { status: 401 }));
 
     const client = await connectClient();
@@ -219,7 +201,7 @@ describe("handleMcpRequest", () => {
     expect(result.isError).toBe(true);
     const text = (result.content as Array<{ text: string }>)[0]!.text;
     expect(text).toContain("401");
-    expect(text).toContain("Check the Authorization header");
+    expect(text).toContain("Check ANNICT_ACCESS_TOKEN");
   });
 
   it("401以外のエラーはそのまま返す", async () => {
@@ -250,38 +232,15 @@ describe("handleMcpRequest", () => {
     expect(annictFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("Authorizationヘッダーがない場合は401を返し、OAuthのチャレンジを付けない", async () => {
+  it("ANNICT_ACCESS_TOKENが未設定なら503を返す", async () => {
+    delete process.env.ANNICT_ACCESS_TOKEN;
+
     const response = await handleMcpRequest(new Request(SERVER_URL));
 
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(503);
     expect(response.headers.get("www-authenticate")).toBeNull();
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-    expect(await response.text()).toContain("Missing Authorization");
-  });
-
-  it("Bearer以外のAuthorizationでもトークンを本文に出さない", async () => {
-    const response = await handleMcpRequest(
-      new Request(SERVER_URL, { headers: { Authorization: "Basic secret-token" } }),
-    );
-    const text = await response.text();
-
-    expect(response.status).toBe(401);
-    expect(text).not.toContain("secret-token");
-  });
-});
-
-describe("bearerToken", () => {
-  it.each([
-    ["bearer token", "token"],
-    ["BEARER token", "token"],
-    ["Bearer   token", "token"],
-    ["Basic token", null],
-    ["Bearer", null],
-    ["Bearer   ", null],
-    [null, null],
-    [undefined, null],
-  ])("%sを受け取ると%sを返す", (header, expected) => {
-    expect(bearerToken(header)).toBe(expected);
+    expect(await response.text()).toContain("ANNICT_ACCESS_TOKEN is not configured");
   });
 });

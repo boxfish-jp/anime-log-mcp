@@ -2,6 +2,9 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAppServer } from "../src/http.js";
 
+const ENV_TOKEN = "test-token";
+const originalToken = process.env.ANNICT_ACCESS_TOKEN;
+
 const VIEWER = {
   id: "VXNlci0x",
   annictId: 1,
@@ -27,12 +30,11 @@ const originalFetch = globalThis.fetch.bind(globalThis);
 const urlOf = (input: RequestInfo | URL): string =>
   typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 
-const mcpRequest = (token: string, method: string, params: Record<string, unknown>): RequestInit => ({
+const mcpRequest = (method: string, params: Record<string, unknown>): RequestInit => ({
   method: "POST",
   headers: {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
-    Authorization: `Bearer ${token}`,
     "Mcp-Method": method,
     "MCP-Protocol-Version": "2026-07-28",
     ...(method === "tools/call" ? { "Mcp-Name": String(params.name) } : {}),
@@ -56,6 +58,7 @@ describe("createAppServer", () => {
   let baseUrl: string;
 
   beforeEach(async () => {
+    process.env.ANNICT_ACCESS_TOKEN = ENV_TOKEN;
     server = createAppServer();
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -66,6 +69,8 @@ describe("createAppServer", () => {
   });
 
   afterEach(async () => {
+    if (originalToken === undefined) delete process.env.ANNICT_ACCESS_TOKEN;
+    else process.env.ANNICT_ACCESS_TOKEN = originalToken;
     vi.unstubAllGlobals();
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
@@ -89,15 +94,17 @@ describe("createAppServer", () => {
     expect(text).toContain("/mcp");
   });
 
-  it("AuthorizationなしのPOST /mcpで401を返す", async () => {
+  it("ANNICT_ACCESS_TOKENが未設定のPOST /mcpで503を返す", async () => {
+    delete process.env.ANNICT_ACCESS_TOKEN;
+
     const response = await fetch(`${baseUrl}/mcp`, { method: "POST" });
 
-    expect(response.status).toBe(401);
-    expect(await response.text()).toContain("Missing Authorization");
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("ANNICT_ACCESS_TOKEN is not configured");
   });
 
-  it("AuthorizationありのPOST /mcpでtools/listを返す", async () => {
-    const response = await fetch(`${baseUrl}/mcp`, mcpRequest("test-token", "tools/list", {}));
+  it("サーバーのトークンでPOST /mcpのtools/listを返す", async () => {
+    const response = await fetch(`${baseUrl}/mcp`, mcpRequest("tools/list", {}));
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as { result: { tools: unknown[] } };
@@ -110,7 +117,7 @@ describe("createAppServer", () => {
     expect(response.status).toBe(403);
   });
 
-  it("tools/callをHTTP経由で実行し、AuthorizationヘッダーのトークンをAnnictへ渡す", async () => {
+  it("tools/callをHTTP経由で実行し、サーバーのトークンをAnnictへ渡す", async () => {
     const annictFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (urlOf(input).startsWith("https://api.annict.com/graphql")) {
         return graphqlResponse({ viewer: VIEWER });
@@ -121,7 +128,7 @@ describe("createAppServer", () => {
 
     const response = await fetch(
       `${baseUrl}/mcp`,
-      mcpRequest("test-token", "tools/call", { name: "annict_get_viewer", arguments: {} }),
+      mcpRequest("tools/call", { name: "annict_get_viewer", arguments: {} }),
     );
     const body = (await response.json()) as {
       result: { content: Array<{ text: string }>; isError?: boolean };
@@ -135,7 +142,29 @@ describe("createAppServer", () => {
       urlOf(input as RequestInfo | URL).startsWith("https://api.annict.com/graphql"),
     );
     expect(annictCall).toBeDefined();
-    expect((annictCall![1] as RequestInit).headers).toMatchObject({ Authorization: "bearer test-token" });
+    expect((annictCall![1] as RequestInit).headers).toMatchObject({ Authorization: `bearer ${ENV_TOKEN}` });
+  });
+
+  it("リクエストのAuthorizationヘッダーではなくサーバーのトークンを使う", async () => {
+    const annictFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (urlOf(input).startsWith("https://api.annict.com/graphql")) {
+        return graphqlResponse({ viewer: VIEWER });
+      }
+      return originalFetch(input, init);
+    });
+    vi.stubGlobal("fetch", annictFetch);
+
+    const init = mcpRequest("tools/call", { name: "annict_get_viewer", arguments: {} });
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", "Bearer ignored-token");
+
+    const response = await fetch(`${baseUrl}/mcp`, { ...init, headers });
+    expect(response.status).toBe(200);
+
+    const annictCall = annictFetch.mock.calls.find(([input]) =>
+      urlOf(input as RequestInfo | URL).startsWith("https://api.annict.com/graphql"),
+    );
+    expect((annictCall![1] as RequestInit).headers).toMatchObject({ Authorization: `bearer ${ENV_TOKEN}` });
   });
 
   it("Annictが401を返すとHTTP経由のツール結果に案内を返す", async () => {
@@ -149,7 +178,7 @@ describe("createAppServer", () => {
 
     const response = await fetch(
       `${baseUrl}/mcp`,
-      mcpRequest("test-token", "tools/call", { name: "annict_get_viewer", arguments: {} }),
+      mcpRequest("tools/call", { name: "annict_get_viewer", arguments: {} }),
     );
     const body = (await response.json()) as {
       result: { content: Array<{ text: string }>; isError?: boolean };
@@ -158,11 +187,11 @@ describe("createAppServer", () => {
     expect(response.status).toBe(200);
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0]!.text).toContain("401");
-    expect(body.result.content[0]!.text).toContain("Check the Authorization header");
+    expect(body.result.content[0]!.text).toContain("Check ANNICT_ACCESS_TOKEN");
 
     const annictCall = annictFetch.mock.calls.find(([input]) =>
       urlOf(input as RequestInfo | URL).startsWith("https://api.annict.com/graphql"),
     );
-    expect((annictCall![1] as RequestInit).headers).toMatchObject({ Authorization: "bearer test-token" });
+    expect((annictCall![1] as RequestInit).headers).toMatchObject({ Authorization: `bearer ${ENV_TOKEN}` });
   });
 });

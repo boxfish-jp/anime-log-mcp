@@ -40,7 +40,7 @@ export const createAppServer = ({ localOnly = true }: { localOnly?: boolean } = 
       sendBody(
         res,
         200,
-        "anime-log-mcp\nMCP endpoint: /mcp\nAuthorization: Bearer <Annict personal access token (read + write)>\nDo not share the token.\n",
+        "anime-log-mcp\nMCP endpoint: /mcp\nThis server uses ANNICT_ACCESS_TOKEN from its environment or .env file.\n",
       );
       return;
     }
